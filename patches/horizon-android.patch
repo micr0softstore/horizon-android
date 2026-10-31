@@ -1,0 +1,1167 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ed7ae30..97b1bb9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -100,6 +100,7 @@ dependencies = [
+  "ndk-context",
+  "ndk-sys",
+  "num_enum",
++ "simd_cesu8",
+  "thiserror 2.0.21",
+ ]
+ 
+@@ -1074,6 +1075,17 @@ dependencies = [
+  "digest",
+ ]
+ 
++[[package]]
++name = "horizon-android"
++version = "0.1.0"
++dependencies = [
++ "horizon-client",
++ "horizon-threads",
++ "serde",
++ "serde_json",
++ "winit",
++]
++
+ [[package]]
+ name = "horizon-anticheat"
+ version = "0.1.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 383252a..f104047 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,6 +7,7 @@ members = [
+     "crates/horizon-hdr",
+     "crates/horizon-world",
+     "crates/horizon-client",
++    "crates/horizon-android",
+     "crates/horizon-client-core",
+     "crates/horizon-client-input",
+     "crates/horizon-client-render",
+diff --git a/crates/horizon-android/Cargo.toml b/crates/horizon-android/Cargo.toml
+new file mode 100644
+index 0000000..2221cfe
+--- /dev/null
++++ b/crates/horizon-android/Cargo.toml
+@@ -0,0 +1,24 @@
++[package]
++name = "horizon-android"
++version = "0.1.0"
++edition.workspace = true
++license.workspace = true
++rust-version = "1.90"
++description = "Android GameActivity entry point for Horizon"
++
++[lib]
++name = "main"
++crate-type = ["cdylib"]
++
++[dependencies]
++horizon-client = { path = "../horizon-client", default-features = false }
++horizon-threads = { path = "../horizon-threads" }
++serde = { version = "1", features = ["derive"] }
++serde_json = "1.0.151"
++winit = { version = "0.30.13", default-features = false, features = ["android-game-activity"] }
++
++[features]
++# Audio uses CPAL's Android AAudio path (API 26+). Keep it opt-in at build
++# time while lifecycle/audio-focus validation is completed on hardware.
++default = []
++audio = ["horizon-client/audio"]
+diff --git a/crates/horizon-android/src/lib.rs b/crates/horizon-android/src/lib.rs
+new file mode 100644
+index 0000000..4111a8f
+--- /dev/null
++++ b/crates/horizon-android/src/lib.rs
+@@ -0,0 +1,174 @@
++//! Android entry point for the Horizon Rust client.
++//!
++//! Kotlin writes a short-lived, app-private launch description before opening
++//! `GameActivity`. The game itself remains Horizon's Rust client; this crate
++//! only binds Android's lifecycle to Winit and translates that description to
++//! the existing command-line launch API.
++
++#[cfg(target_os = "android")]
++use std::{
++    fs,
++    path::{Path, PathBuf},
++};
++
++#[cfg(target_os = "android")]
++use winit::platform::android::activity::AndroidApp;
++
++#[cfg(target_os = "android")]
++#[derive(serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct LaunchConfig {
++    game_dir: PathBuf,
++    resources_dir: PathBuf,
++    home_dir: PathBuf,
++    control_endpoint: PathBuf,
++    render_distance: u8,
++}
++
++#[cfg(target_os = "android")]
++#[derive(serde::Serialize)]
++struct RunResult<'a> {
++    state: &'a str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    message: Option<&'a str>,
++    #[serde(rename = "updatedAtMillis")]
++    updated_at_millis: u64,
++}
++
++// The desktop executable owns this allocator normally.  A cdylib has no
++// `horizon-client` binary linked into it, so Android must install it here.
++#[global_allocator]
++static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
++
++/// Android's GameActivity glue calls this from its native lifecycle thread.
++#[cfg(target_os = "android")]
++#[unsafe(no_mangle)]
++pub fn android_main(app: AndroidApp) {
++    let result_file = app
++        .internal_data_path()
++        .map(|dir| dir.join("horizon/runtime-status.json"));
++    write_run_result(result_file.as_deref(), "running", None);
++    if let Err(error) = start(app) {
++        eprintln!("Horizon Android failed to start: {error}");
++        let message = error.to_string();
++        write_run_result(result_file.as_deref(), "failed", Some(&message));
++    } else {
++        write_run_result(result_file.as_deref(), "completed", None);
++    }
++}
++
++#[cfg(target_os = "android")]
++fn start(app: AndroidApp) -> horizon_client::Result<()> {
++    horizon_threads::configure_allocator();
++    let internal_root = app
++        .internal_data_path()
++        .ok_or("Android did not supply an internal data directory")?;
++    // GameActivity's `internalDataPath` is Android's `Context.filesDir`;
++    // unlike the package data root it already ends in `/files`.
++    let launch_file = internal_root.join("horizon/active-launch.json");
++    let config: LaunchConfig = serde_json::from_slice(&fs::read(&launch_file)?)?;
++    prepare_paths(&internal_root, &config)?;
++
++    // The desktop binary normally does this before `game::run`. Android does
++    // the same setup here, using only app-private paths supplied by Kotlin.
++    horizon_client::logging::set_game_home(config.home_dir.clone());
++    horizon_client::logging::init(&config.home_dir, "Render thread");
++    horizon_client::crash::install(config.home_dir.clone(), "client");
++    horizon_client::telemetry::mark_start();
++
++    let args = vec![
++        "--game-dir".into(),
++        path_arg(&config.game_dir),
++        "--resources".into(),
++        path_arg(&config.resources_dir),
++        "--home".into(),
++        path_arg(&config.home_dir),
++        "--control-socket".into(),
++        path_arg(&config.control_endpoint),
++        "--render-distance".into(),
++        config.render_distance.to_string(),
++        "--fullscreen".into(),
++    ];
++    let result = horizon_client::game::run_android(app, args);
++    if let Err(error) = &result {
++        horizon_client::crash::report_error(&config.home_dir, "client", &**error);
++    }
++    horizon_client::logging::flush();
++    result
++}
++
++#[cfg(target_os = "android")]
++fn prepare_paths(internal_root: &Path, config: &LaunchConfig) -> std::io::Result<()> {
++    for (name, path) in [
++        ("gameDir", &config.game_dir),
++        ("resourcesDir", &config.resources_dir),
++        ("homeDir", &config.home_dir),
++        ("controlEndpoint", &config.control_endpoint),
++    ] {
++        if !path.is_absolute() || !path.starts_with(internal_root) {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!("{name} must be an absolute path inside filesDir"),
++            ));
++        }
++    }
++    fs::create_dir_all(&config.game_dir)?;
++    fs::create_dir_all(&config.home_dir)?;
++    if !config.resources_dir.join("horizon-resources.json").is_file() {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!(
++                "prepared resources missing (no horizon-resources.json): {}",
++                config.resources_dir.display()
++            ),
++        ));
++    }
++    if let Some(parent) = config.control_endpoint.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    // Android is a Unix target, so force the JSON/TCP endpoint that Kotlin's
++    // loopback bridge understands instead of a Unix-domain socket.
++    if !horizon_client::control::uses_tcp(&config.control_endpoint) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "controlEndpoint must end in .json on Android",
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "android")]
++fn path_arg(path: &Path) -> String {
++    path.to_string_lossy().into_owned()
++}
++
++/// Writes a tiny, atomically replaced result file for the Kotlin host.  The
++/// activity should clear a previous result before launch and finish itself
++/// after it observes `completed` or `failed`; returning from `android_main`
++/// intentionally lets GameActivity unwind rather than killing the process.
++#[cfg(target_os = "android")]
++fn write_run_result(path: Option<&Path>, state: &str, message: Option<&str>) {
++    let Some(path) = path else { return };
++    let Some(parent) = path.parent() else { return };
++    if fs::create_dir_all(parent).is_err() {
++        return;
++    }
++    let updated_at_millis = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |elapsed| elapsed.as_millis() as u64);
++    let Ok(json) = serde_json::to_vec(&RunResult {
++        state,
++        message,
++        updated_at_millis,
++    }) else {
++        return;
++    };
++    let temporary = path.with_extension("tmp");
++    if fs::write(&temporary, json).is_ok() {
++        let _ = fs::rename(temporary, path);
++    }
++}
++
++// Allows `cargo check -p horizon-android` on a desktop development machine.
++#[cfg(not(target_os = "android"))]
++pub fn desktop_placeholder() {}
+diff --git a/crates/horizon-client-input/Cargo.toml b/crates/horizon-client-input/Cargo.toml
+index e1d7cf7..361e71e 100644
+--- a/crates/horizon-client-input/Cargo.toml
++++ b/crates/horizon-client-input/Cargo.toml
+@@ -12,10 +12,12 @@ winit = "0.30.13"
+ # The window icon.
+ horizon-theme = { path = "../horizon-theme" }
+ png = "0.18"
+-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+ # The DualSense's trigger effects (the `controllers` feature).
+ horizon-dualsense = { path = "../horizon-dualsense", optional = true }
+ 
++[target.'cfg(not(target_os = "android"))'.dependencies]
++arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
++
+ [features]
+ controllers = ["dep:horizon-dualsense"]
+ 
+diff --git a/crates/horizon-client-input/src/clipboard.rs b/crates/horizon-client-input/src/clipboard.rs
+index eaf2a22..d3f2ba6 100644
+--- a/crates/horizon-client-input/src/clipboard.rs
++++ b/crates/horizon-client-input/src/clipboard.rs
+@@ -123,6 +123,7 @@ pub trait Clipboard {
+ /// data-control protocol and falls back to X11 (XWayland) on compositors
+ /// without it. When no system clipboard can be reached, text copied in the
+ /// game can still be pasted in the game.
++#[cfg(not(target_os = "android"))]
+ #[derive(Default)]
+ pub struct SystemClipboard {
+     system: Option<arboard::Clipboard>,
+@@ -130,6 +131,7 @@ pub struct SystemClipboard {
+     copied: Option<String>,
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl SystemClipboard {
+     /// The text last copied by the game.
+     pub fn copied(&self) -> Option<&str> {
+@@ -143,6 +145,7 @@ impl SystemClipboard {
+     }
+ }
+ 
++#[cfg(not(target_os = "android"))]
+ impl Clipboard for SystemClipboard {
+     fn get(&mut self) -> String {
+         let Some(system) = self.system() else {
+@@ -171,6 +174,35 @@ impl Clipboard for SystemClipboard {
+     }
+ }
+ 
++/// Android's launcher owns the platform clipboard and IME lifecycle. Until
++/// that bridge is enabled, retain copied text in process rather than linking a
++/// desktop clipboard backend that assumes X11/Wayland/Win32.
++#[cfg(target_os = "android")]
++#[derive(Default)]
++pub struct SystemClipboard {
++    copied: Option<String>,
++}
++
++#[cfg(target_os = "android")]
++impl SystemClipboard {
++    /// The text last copied by the game.
++    pub fn copied(&self) -> Option<&str> {
++        self.copied.as_deref()
++    }
++}
++
++#[cfg(target_os = "android")]
++impl Clipboard for SystemClipboard {
++    fn get(&mut self) -> String {
++        self.copied.clone().unwrap_or_default()
++    }
++    fn set(&mut self, text: &str) {
++        if !text.is_empty() {
++            self.copied = Some(text.to_owned());
++        }
++    }
++}
++
+ /// A clipboard in memory.
+ #[derive(Default, Debug)]
+ pub struct MemoryClipboard(pub String);
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 3492e5d..793d0a4 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -1081,12 +1081,14 @@ async fn open_backend(
+         required_limits: limits,
+         ..Default::default()
+     };
+-    #[cfg(not(target_os = "macos"))]
++    // Horizon's custom HDR Vulkan opener is a desktop path. Android should
++    // use WGPU's normal Android Vulkan device request and surface lifecycle.
++    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+     let opened = match info.backend {
+         wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(&adapter, &desc),
+         _ => None,
+     };
+-    #[cfg(target_os = "macos")]
++    #[cfg(any(target_os = "macos", target_os = "android"))]
+     let opened = None;
+     let opened = match opened {
+         Some(opened) => opened,
+@@ -2906,6 +2908,20 @@ impl Renderer {
+             .get_mut()
+             .unwrap_or_else(std::sync::PoisonError::into_inner) = self.surface.take();
+     }
++    /// Drop the window surface when Android's `SurfaceView` is terminated.
++    ///
++    /// A Winit `Window` can survive Android's suspend/resume pair, but its raw
++    /// native window cannot.  Keeping the old `wgpu::Surface` (including in
++    /// `spare_surface`) would make a later acquire reference that dead native
++    /// window.  `recreate_surface` will create a fresh surface on resume.
++    pub fn drop_surface_for_suspend(&mut self) {
++        self.surface = None;
++        self.spare_surface
++            .get_mut()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++        self.suspended = true;
++    }
+     /// Reattach a window after surface loss or a failed renderer replacement.
+     pub fn recreate_surface(&mut self) -> Result<()> {
+         if self.offscreen.is_some() {
+diff --git a/crates/horizon-client/Cargo.toml b/crates/horizon-client/Cargo.toml
+index 8775234..cb66a20 100644
+--- a/crates/horizon-client/Cargo.toml
++++ b/crates/horizon-client/Cargo.toml
+@@ -69,6 +69,12 @@ unicode-bidi = "0.3.18"
+ # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
+ rustix = { version = "1", default-features = false, features = ["std", "time", "process"] }
+ 
++[target.'cfg(target_os = "android")'.dependencies]
++# `game::run_android` builds Winit's event loop from GameActivity's AndroidApp.
++# Keep the feature with the client rather than relying on feature unification
++# from the small Android entry crate.
++winit = { version = "0.30.13", default-features = false, features = ["android-game-activity"] }
++
+ [target.'cfg(windows)'.dependencies]
+ # Use the registered URI handler without routing links through Explorer/cmd.
+ open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 840f40d..a9b7ff6 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -329,6 +329,37 @@ use winit::{
+     window::{CursorGrabMode, Window, WindowId},
+ };
+ 
++// Winit deliberately does not keep the Android activity in global state. The
++// Android entry crate sets it immediately before the client starts, and both
++// loading and gameplay event loops take a clone from this slot.
++#[cfg(target_os = "android")]
++use winit::platform::android::{EventLoopBuilderExtAndroid, activity::AndroidApp};
++
++#[cfg(target_os = "android")]
++thread_local! {
++    static ANDROID_APP: RefCell<Option<AndroidApp>> = const { RefCell::new(None) };
++}
++
++fn new_event_loop() -> std::result::Result<EventLoop<()>, EventLoopError> {
++    #[cfg(target_os = "android")]
++    {
++        ANDROID_APP.with(|slot| {
++            let app = slot
++                .borrow()
++                .as_ref()
++                .expect("Horizon Android started without AndroidApp")
++                .clone();
++            let mut builder = EventLoop::builder();
++            builder.with_android_app(app);
++            builder.build()
++        })
++    }
++    #[cfg(not(target_os = "android"))]
++    {
++        EventLoop::new()
++    }
++}
++
+ #[derive(Clone)]
+ struct Options {
+     resources: PathBuf,
+@@ -411,9 +442,8 @@ impl Options {
+     }
+     /// The command line, then what it asks of the process: the game folder, the account.
+     /// A bad command line is a [`launch_api::UsageError`] (exit code 2, no crash report).
+-    fn read() -> Result<Option<Self>> {
+-        let Some(mut o) = Self::parse(std::env::args().skip(1))
+-            .map_err(|e| launch_api::UsageError(e.to_string()))?
++    fn read(args: impl Iterator<Item = String>) -> Result<Option<Self>> {
++        let Some(mut o) = Self::parse(args).map_err(|e| launch_api::UsageError(e.to_string()))?
+         else {
+             return Ok(None);
+         };
+@@ -1754,6 +1784,16 @@ struct Game<'a> {
+     was_playing: bool,
+     /// Minecraft.pause: a single-player screen that pauses the game is open.
+     pause: bool,
++    /// A GameActivity surface was terminated. Android keeps the Winit window
++    /// object across this lifecycle transition, but it must not render or poll
++    /// the control socket again until Winit supplies a new surface.
++    #[cfg(target_os = "android")]
++    android_suspended: bool,
++    /// The first finger mapped to a left mouse button while a menu is open.
++    /// Gameplay deliberately has no touch-to-mouse fallback: the Android
++    /// overlay owns its taps there.
++    #[cfg(target_os = "android")]
++    android_menu_touch: Option<u64>,
+     debug: bool,
+     screen: Screen,
+     window: Option<Arc<Window>>,
+@@ -2352,6 +2392,76 @@ fn camera_rotation(camera_type: perspective::CameraType, yaw: f32, pitch: f32) -
+     )
+ }
+ impl Game<'_> {
++    /// Route one Android finger as a mouse only while a menu/title owns the
++    /// screen. The Compose controls intentionally leave uncovered regions for
++    /// the SurfaceView, so this keeps ordinary menu taps usable without
++    /// competing with in-game touch controls.
++    #[cfg(target_os = "android")]
++    fn route_android_menu_touch(
++        &mut self,
++        event_loop: &ActiveEventLoop,
++        id: WindowId,
++        touch: winit::event::Touch,
++    ) -> bool {
++        use winit::event::TouchPhase;
++
++        let menu_open = self.title.is_some() || self.screen != Screen::Playing;
++        match touch.phase {
++            TouchPhase::Started if !menu_open || self.android_suspended => return false,
++            TouchPhase::Started if self.android_menu_touch.is_some() => return true,
++            TouchPhase::Started => self.android_menu_touch = Some(touch.id),
++            TouchPhase::Moved if self.android_menu_touch != Some(touch.id) => return true,
++            TouchPhase::Moved if !menu_open || self.android_suspended => return true,
++            TouchPhase::Ended | TouchPhase::Cancelled
++                if self.android_menu_touch != Some(touch.id) =>
++            {
++                return true;
++            }
++            TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled => {}
++        }
++
++        // Keep the menu cursor under the finger before either edge. It makes
++        // a touch down behave exactly like a desktop click at that position.
++        if menu_open && !self.android_suspended {
++            self.window_event(
++                event_loop,
++                id,
++                WindowEvent::CursorMoved {
++                    device_id: touch.device_id,
++                    position: touch.location,
++                },
++            );
++        }
++        match touch.phase {
++            TouchPhase::Started => self.window_event(
++                event_loop,
++                id,
++                WindowEvent::MouseInput {
++                    device_id: touch.device_id,
++                    state: ElementState::Pressed,
++                    button: MouseButton::Left,
++                },
++            ),
++            TouchPhase::Ended | TouchPhase::Cancelled => {
++                // Always send the release, even if the press changed from a
++                // title into gameplay, so Winit's physical button set cannot
++                // retain a stale left button.
++                self.window_event(
++                    event_loop,
++                    id,
++                    WindowEvent::MouseInput {
++                        device_id: touch.device_id,
++                        state: ElementState::Released,
++                        button: MouseButton::Left,
++                    },
++                );
++                self.android_menu_touch = None;
++            }
++            TouchPhase::Moved => {}
++        }
++        true
++    }
++
+     fn eye_position(&self) -> Option<[f64; 3]> {
+         let p = self.player.as_ref()?;
+         Some([
+@@ -13711,9 +13821,95 @@ impl Game<'_> {
+         }
+     }
+ }
++impl Game<'_> {
++    /// Android invalidates the native window beneath Winit on every
++    /// `SurfaceView` termination. Keep the game state, but drop the renderer's
++    /// surface until the following `resumed` callback creates a new one.
++    fn suspend_for_android(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            if self.android_suspended {
++                event_loop.set_control_flow(ControlFlow::Wait);
++                return;
++            }
++            self.android_suspended = true;
++
++            // GameActivity can destroy its SurfaceView before a release
++            // reaches the local control socket. Do not leave movement, mining
++            // or a virtual pad pressed while the Android activity is away.
++            self.focused = false;
++            self.focus_lost = Some(Instant::now());
++            self.physical_keys.clear();
++            self.physical_buttons.clear();
++            self.keys.clear();
++            self.left = false;
++            self.right = false;
++            self.toggles = Default::default();
++            self.mouse = MouseLook::default();
++            self.android_menu_touch = None;
++            self.capture(false);
++            self.release_pad_for_suspend(event_loop);
++
++            // A running integrated server is independent of redraws. Pause it
++            // explicitly; its next server tick performs the usual async
++            // autosave. A no-server-thread local world needs the equivalent
++            // save on this game thread instead.
++            self.pause = true;
++            self.clock.end_frame(true);
++            if let Some(server) = &self.integrated {
++                server.set_paused(true);
++            }
++            if let Some(starting) = &self.integrated_starting {
++                starting.set_paused(true);
++            }
++            if self.integrated.is_none()
++                && self.remote.is_none()
++                && self.title.is_none()
++                && !self.world_root.as_os_str().is_empty()
++                && let Err(error) = self.save_game_with(false)
++            {
++                log::warn!("Horizon: Android suspend autosave: {error}");
++            }
++
++            if let Some(renderer) = &mut self.renderer {
++                renderer.drop_surface_for_suspend();
++            }
++            // The Android backend cannot deliver a useful redraw while its
++            // SurfaceView is gone. Waiting also keeps an outstanding control
++            // request from turning the event loop into a busy spin.
++            event_loop.set_control_flow(ControlFlow::Wait);
++        }
++        #[cfg(not(target_os = "android"))]
++        let _ = event_loop;
++    }
++}
++
+ impl ApplicationHandler for Game<'_> {
+     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            self.android_suspended = false;
++            // Do not turn the time spent without a SurfaceView into one giant
++            // client frame when Android gives the activity back.
++            self.previous = Instant::now();
++            self.frame_ticks = 0.0;
++            event_loop.set_control_flow(ControlFlow::Poll);
++        }
+         if self.window.is_some() {
++            #[cfg(target_os = "android")]
++            if let Some(renderer) = &mut self.renderer {
++                if let Err(error) = renderer.recreate_surface() {
++                    self.error = Some(error);
++                    event_loop.exit();
++                    return;
++                }
++                let size = self
++                    .window
++                    .as_ref()
++                    .expect("window checked above")
++                    .inner_size();
++                renderer.resize(size.width, size.height);
++            }
+             return;
+         }
+         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
+@@ -13756,10 +13952,19 @@ impl ApplicationHandler for Game<'_> {
+         self.apply_settings();
+         self.previous = Instant::now();
+     }
++    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
++        self.suspend_for_android(event_loop);
++    }
+     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, mut event: WindowEvent) {
+         if self.window.as_ref().is_none_or(|w| w.id() != id) {
+             return;
+         }
++        #[cfg(target_os = "android")]
++        if let WindowEvent::Touch(touch) = &event
++            && self.route_android_menu_touch(event_loop, id, *touch)
++        {
++            return;
++        }
+         follow_keymap(&mut event);
+         if let WindowEvent::KeyboardInput { event, .. } = &event
+             && let PhysicalKey::Code(key) = event.physical_key
+@@ -14742,6 +14947,11 @@ impl ApplicationHandler for Game<'_> {
+         }
+     }
+     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        if self.android_suspended {
++            event_loop.set_control_flow(ControlFlow::Wait);
++            return;
++        }
+         if horizon_threads::stop_requests() > 0
+             && self.pending_save.as_ref().is_none_or(|save| !save.quit)
+         {
+@@ -14966,6 +15176,10 @@ impl<'a> Game<'a> {
+             toggles: Default::default(),
+             was_playing: false,
+             pause: false,
++            #[cfg(target_os = "android")]
++            android_suspended: false,
++            #[cfg(target_os = "android")]
++            android_menu_touch: None,
+             debug: false,
+             screen: Screen::Playing,
+             window: None,
+@@ -15647,7 +15861,11 @@ fn synchronous_startup(options: &Options) -> bool {
+     options.frames.is_some()
+         || options.world_frames.is_some()
+         || options.benchmark.is_some()
+-        || options.control.is_some()
++        // Desktop control clients historically ask for a fully synchronous
++        // startup. Android's touch overlay uses the same local endpoint, but
++        // must enter Winit promptly so GameActivity can supply a SurfaceView;
++        // its Kotlin bridge retries until the endpoint opens after loading.
++        || (options.control.is_some() && !cfg!(target_os = "android"))
+         || !options.execution_role.is_client()
+         || std::env::var_os("HORIZON_DISPENSE_FIXTURE").is_some()
+         || std::env::var_os("HORIZON_SCULK_FIXTURE").is_some()
+@@ -16350,7 +16568,7 @@ fn leave_fullscreen_after(
+ }
+ 
+ fn run_event_loop(mut game: Game<'_>) -> Result<()> {
+-    let result = EventLoop::new()?.run_app(&mut game);
++    let result = new_event_loop()?.run_app(&mut game);
+     leave_fullscreen_after(&result, &mut game.settings);
+     result?;
+     horizon_client::discord_presence::stop();
+@@ -16382,10 +16600,47 @@ struct Loading {
+     shown: bool,
+     menu: startup_menu::StartupMenu,
+     error: Option<Box<dyn std::error::Error>>,
++    /// The GameActivity surface is unavailable. Keep the loader worker alive,
++    /// but do not turn its result into a renderer until Android resumes.
++    #[cfg(target_os = "android")]
++    android_suspended: bool,
++    /// The single finger converted to a desktop-style click for the startup
++    /// menu. The game overlay is not active during this phase.
++    #[cfg(target_os = "android")]
++    android_menu_touch: Option<u64>,
+ }
+ impl Loading {
++    #[cfg(target_os = "android")]
++    fn is_android_suspended(&self) -> bool {
++        self.android_suspended
++    }
++
++    #[cfg(not(target_os = "android"))]
++    fn is_android_suspended(&self) -> bool {
++        false
++    }
++
+     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            self.android_suspended = false;
++            event_loop.set_control_flow(ControlFlow::Poll);
++        }
+         if self.window.is_some() {
++            #[cfg(target_os = "android")]
++            if let Some(renderer) = &mut self.renderer {
++                if let Err(error) = renderer.recreate_surface() {
++                    self.error = Some(error);
++                    event_loop.exit();
++                    return;
++                }
++                let size = self
++                    .window
++                    .as_ref()
++                    .expect("window checked above")
++                    .inner_size();
++                renderer.resize(size.width, size.height);
++            }
+             return;
+         }
+         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
+@@ -16436,16 +16691,95 @@ impl Loading {
+         horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+         self.window = Some(window);
+     }
++    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            self.android_suspended = true;
++            self.android_menu_touch = None;
++            if let Some(renderer) = &mut self.renderer {
++                renderer.drop_surface_for_suspend();
++            }
++            event_loop.set_control_flow(ControlFlow::Wait);
++        }
++        #[cfg(not(target_os = "android"))]
++        let _ = event_loop;
++    }
+     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, mut event: WindowEvent) {
+         if self.window.as_ref().is_none_or(|w| w.id() != id) {
+             return;
+         }
++        #[cfg(target_os = "android")]
++        if let WindowEvent::Touch(touch) = &event
++            && self.route_android_menu_touch(event_loop, id, *touch)
++        {
++            return;
++        }
+         follow_keymap(&mut event);
+         if let Err(error) = self.menu_event(event_loop, event) {
+             self.error = Some(error);
+             event_loop.exit();
+         }
+     }
++    /// The startup UI shares desktop menu event handling. On Android map its
++    /// first finger to that mouse path so title and options buttons work in
++    /// SurfaceView regions not covered by the Compose overlay.
++    #[cfg(target_os = "android")]
++    fn route_android_menu_touch(
++        &mut self,
++        event_loop: &ActiveEventLoop,
++        id: WindowId,
++        touch: winit::event::Touch,
++    ) -> bool {
++        use winit::event::TouchPhase;
++
++        if self.android_suspended {
++            return false;
++        }
++        match touch.phase {
++            TouchPhase::Started if self.android_menu_touch.is_some() => return true,
++            TouchPhase::Started => self.android_menu_touch = Some(touch.id),
++            TouchPhase::Moved if self.android_menu_touch != Some(touch.id) => return true,
++            TouchPhase::Ended | TouchPhase::Cancelled
++                if self.android_menu_touch != Some(touch.id) =>
++            {
++                return true;
++            }
++            TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled => {}
++        }
++        self.window_event(
++            event_loop,
++            id,
++            WindowEvent::CursorMoved {
++                device_id: touch.device_id,
++                position: touch.location,
++            },
++        );
++        match touch.phase {
++            TouchPhase::Started => self.window_event(
++                event_loop,
++                id,
++                WindowEvent::MouseInput {
++                    device_id: touch.device_id,
++                    state: ElementState::Pressed,
++                    button: MouseButton::Left,
++                },
++            ),
++            TouchPhase::Ended | TouchPhase::Cancelled => {
++                self.window_event(
++                    event_loop,
++                    id,
++                    WindowEvent::MouseInput {
++                        device_id: touch.device_id,
++                        state: ElementState::Released,
++                        button: MouseButton::Left,
++                    },
++                );
++                self.android_menu_touch = None;
++            }
++            TouchPhase::Moved => {}
++        }
++        true
++    }
+     /// The menu bundle arrived: rebuild the loading screen with the real atlas
+     /// and title panorama.
+     fn set_ui(&mut self, gui: UiResources, root: PathBuf) {
+@@ -16479,6 +16813,10 @@ impl Loading {
+         }
+     }
+     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
++        if self.is_android_suspended() {
++            event_loop.set_control_flow(ControlFlow::Wait);
++            return;
++        }
+         // The loop may run once more after exit(): keep the first error, the
+         // one that ended loading.
+         if self.error.is_some() {
+@@ -16623,6 +16961,12 @@ impl ApplicationHandler for App {
+             App::Ready(game) => game.resumed(event_loop),
+         }
+     }
++    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
++        match self {
++            App::Loading(loading) => loading.suspended(event_loop),
++            App::Ready(game) => game.suspend_for_android(event_loop),
++        }
++    }
+     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+         match self {
+             App::Loading(loading) => loading.window_event(event_loop, id, event),
+@@ -16648,6 +16992,9 @@ impl ApplicationHandler for App {
+             }
+             App::Loading(loading) => {
+                 loading.about_to_wait(event_loop);
++                if loading.is_android_suspended() {
++                    return;
++                }
+                 if loading.error.is_some() {
+                     event_loop.exit();
+                     return;
+@@ -16736,9 +17083,13 @@ fn run_loading(
+         shown: false,
+         menu,
+         error: None,
++        #[cfg(target_os = "android")]
++        android_suspended: false,
++        #[cfg(target_os = "android")]
++        android_menu_touch: None,
+     };
+     let mut app = App::Loading(Box::new(loading));
+-    let result = EventLoop::new()?.run_app(&mut app);
++    let result = new_event_loop()?.run_app(&mut app);
+     match &mut app {
+         App::Ready(game) => leave_fullscreen_after(&result, &mut game.settings),
+         App::Loading(loading) => leave_fullscreen_after(&result, &mut loading.settings),
+@@ -16764,7 +17115,14 @@ fn run_loading(
+ pub use launch_api::{UsageError, exit_code};
+ 
+ pub fn run() -> Result<()> {
+-    let Some(mut options) = Options::read()? else {
++    run_with_args(std::env::args().skip(1))
++}
++
++/// Runs the playable client with arguments supplied by a host application.
++/// Desktop `main` passes process arguments; Android passes its app-private
++/// launch configuration without inventing a second option parser.
++pub fn run_with_args(args: impl Iterator<Item = String>) -> Result<()> {
++    let Some(mut options) = Options::read(args)? else {
+         return Ok(());
+     };
+     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
+@@ -16804,7 +17162,7 @@ pub fn run() -> Result<()> {
+     // official server in their list (servers.dat in the game folder, the working directory). Not
+     // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
+     // horizon-ctl drives: those start in a source checkout and wrote the list there.
+-    if !options.offscreen && !synchronous_startup(&options) {
++    if !cfg!(target_os = "android") && !options.offscreen && !synchronous_startup(&options) {
+         horizon_client::heartbeat::start();
+         if let Err(e) = horizon_client::multiplayer::add_official_server(&std::env::current_dir()?)
+         {
+@@ -16813,7 +17171,7 @@ pub fn run() -> Result<()> {
+     }
+     let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+     // "Playing Horizon" on Discord: never for a server; an automated run only talks to a test's fake Discord.
+-    if options.dedicated.is_none() {
++    if !cfg!(target_os = "android") && options.dedicated.is_none() {
+         let automated = options.benchmark.is_some()
+             || options.offscreen
+             || options.frames.is_some()
+@@ -16875,6 +17233,19 @@ pub fn run() -> Result<()> {
+     Ok(())
+ }
+ 
++/// Android's `GameActivity` owns the lifecycle and hands Winit the
++/// `AndroidApp` it received from `android_main`. Keeping this separate from
++/// `run_with_args` leaves the desktop executable untouched.
++#[cfg(target_os = "android")]
++pub fn run_android(app: AndroidApp, args: Vec<String>) -> Result<()> {
++    ANDROID_APP.with(|slot| *slot.borrow_mut() = Some(app));
++    let result = run_with_args(args.into_iter());
++    ANDROID_APP.with(|slot| {
++        slot.borrow_mut().take();
++    });
++    result
++}
++
+ /// The right and left arms of a player model layer (`PlayerModel.rightArm`
+ /// and `leftArm`, with their sleeves).
+ fn player_arms(root: &std::path::Path, key: &str) -> [Option<horizon_client::mobs::Part>; 2] {
+diff --git a/crates/horizon-client/src/game/integrated.rs b/crates/horizon-client/src/game/integrated.rs
+index 8d1eb64..f3baebb 100644
+--- a/crates/horizon-client/src/game/integrated.rs
++++ b/crates/horizon-client/src/game/integrated.rs
+@@ -186,6 +186,15 @@ pub(super) struct Starting {
+     /// The save's folder in `saves/`, for the world icon once joined.
+     folder: String,
+ }
++impl Starting {
++    /// The Android activity can suspend while this server is still preparing
++    /// its world. Preserve that request so its first tick pauses and autosaves
++    /// instead of running in the background until the window catches up.
++    #[cfg(target_os = "android")]
++    pub(super) fn set_paused(&self, paused: bool) {
++        self.handle.set_paused(paused);
++    }
++}
+ 
+ /// The world to open and the player who owns it.
+ struct Launch {
+diff --git a/crates/horizon-client/src/game/no_resources.rs b/crates/horizon-client/src/game/no_resources.rs
+index 0b80957..fc8b1e3 100644
+--- a/crates/horizon-client/src/game/no_resources.rs
++++ b/crates/horizon-client/src/game/no_resources.rs
+@@ -15,6 +15,10 @@ struct Missing {
+     pointer: (f64, f64),
+     api: horizon_client::graphics::GraphicsApi,
+     error: Option<Box<dyn std::error::Error>>,
++    /// A terminated Android SurfaceView has no valid swapchain until Winit's
++    /// following `resumed` callback recreates it.
++    #[cfg(target_os = "android")]
++    android_suspended: bool,
+ }
+ 
+ /// Shows the screen until the player closes it.
+@@ -33,9 +37,11 @@ pub(super) fn show(looked_in: &std::path::Path, settings: &Settings) -> Result<(
+         pointer: (0.0, 0.0),
+         api: settings.horizon.api,
+         error: None,
++        #[cfg(target_os = "android")]
++        android_suspended: false,
+     };
+     horizon_client::hud::GUI_SCALE.store(settings.gui_scale, Ordering::Relaxed);
+-    EventLoop::new()?.run_app(&mut app)?;
++    new_event_loop()?.run_app(&mut app)?;
+     app.error.map_or(Ok(()), Err)
+ }
+ 
+@@ -93,7 +99,26 @@ impl Missing {
+ 
+ impl ApplicationHandler for Missing {
+     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            self.android_suspended = false;
++            event_loop.set_control_flow(ControlFlow::Poll);
++        }
+         if self.window.is_some() {
++            #[cfg(target_os = "android")]
++            if let Some(renderer) = &mut self.renderer {
++                if let Err(error) = renderer.recreate_surface() {
++                    self.error = Some(error);
++                    event_loop.exit();
++                    return;
++                }
++                let size = self
++                    .window
++                    .as_ref()
++                    .expect("window checked above")
++                    .inner_size();
++                renderer.resize(size.width, size.height);
++            }
+             return;
+         }
+         let attributes = Window::default_attributes()
+@@ -122,6 +147,19 @@ impl ApplicationHandler for Missing {
+         }
+     }
+ 
++    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        {
++            self.android_suspended = true;
++            if let Some(renderer) = &mut self.renderer {
++                renderer.drop_surface_for_suspend();
++            }
++            event_loop.set_control_flow(ControlFlow::Wait);
++        }
++        #[cfg(not(target_os = "android"))]
++        let _ = event_loop;
++    }
++
+     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+         let Some(window) = self.window.clone().filter(|w| w.id() == id) else {
+             return;
+@@ -155,6 +193,11 @@ impl ApplicationHandler for Missing {
+     }
+ 
+     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
++        #[cfg(target_os = "android")]
++        if self.android_suspended {
++            event_loop.set_control_flow(ControlFlow::Wait);
++            return;
++        }
+         if horizon_threads::stop_requests() > 0 {
+             event_loop.exit();
+             return;
+diff --git a/crates/horizon-client/src/game/pad.rs b/crates/horizon-client/src/game/pad.rs
+index 0589354..ec6c91b 100644
+--- a/crates/horizon-client/src/game/pad.rs
++++ b/crates/horizon-client/src/game/pad.rs
+@@ -89,6 +89,24 @@ impl Pads {
+ }
+ 
+ impl Game<'_> {
++    /// Android may stop the Winit loop before the touch overlay can send its
++    /// normal `pad release` request. Dispatch every held edge now so gameplay
++    /// mappings (especially attack and use) cannot remain pressed on resume.
++    #[cfg(target_os = "android")]
++    pub(super) fn release_pad_for_suspend(&mut self, event_loop: &ActiveEventLoop) {
++        self.pad.injected = PadState::default();
++        self.pad.taps.clear();
++        self.pad.late_releases.clear();
++        self.pad.state = PadState::default();
++        self.pad.virtual_input = false;
++        self.pad.in_use = false;
++        self.pad.pressed_at = [None; 16];
++        self.pad_output_off();
++        for (button, _) in self.pad.edges.release_all() {
++            self.pad_button_logged(event_loop, button, false);
++        }
++    }
++
+     /// Once per loop iteration: read the pads and act on button changes.
+     pub(super) fn poll_pads(&mut self, event_loop: &ActiveEventLoop) {
+         let settings = &self.settings.controller;
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index af34740..4672d16 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -1,10 +1,17 @@
+ //! Horizon native client: resources, world streaming, rendering and the
+ //! bindings between the validated simulation pieces and the game loop.
+ #![forbid(unsafe_code)]
++
++// `game.rs` is shared by the desktop binary and the Android cdylib.  The game
++// was originally a binary-only module and therefore uses `horizon_client::…`
++// paths throughout; make that crate name resolve to this library as well.
++extern crate self as horizon_client;
++
+ pub mod advancements;
+ pub mod ambience;
+ pub mod animate_tick;
+ pub mod arrows;
++pub mod game;
+ pub use horizon_client_render::{
+     assets, atlas_sources, audio, auth, bidi, biome, block_entities, block_entity_anim,
+     block_entity_render, border_render, breaking, brewing, camera, chat, chunk, chunk_map, clouds,
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index 2167526..7da6412 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -1,8 +1,7 @@
+ //! Horizon: native Rust client for Minecraft Java Edition 26.3 gameplay.
+ #![forbid(unsafe_code)]
+-mod game;
+ 
+-use horizon_client::{crash, logging};
++use horizon_client::{crash, game, logging};
+ 
+ #[global_allocator]
+ static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
+diff --git a/crates/horizon-hdr/Cargo.toml b/crates/horizon-hdr/Cargo.toml
+index 297c758..c2660ca 100644
+--- a/crates/horizon-hdr/Cargo.toml
++++ b/crates/horizon-hdr/Cargo.toml
+@@ -9,7 +9,7 @@ description = "HDR metadata for the swapchain: the Vulkan calls the crates that
+ [dependencies]
+ wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
+ 
+-[target.'cfg(not(target_os = "macos"))'.dependencies]
++[target.'cfg(not(any(target_os = "macos", target_os = "android")))'.dependencies]
+ # The version wgpu-hal already uses.
+ ash = { version = "0.38", default-features = false }
+ 
+diff --git a/crates/horizon-hdr/src/lib.rs b/crates/horizon-hdr/src/lib.rs
+index 4f7d737..e1c1bf3 100644
+--- a/crates/horizon-hdr/src/lib.rs
++++ b/crates/horizon-hdr/src/lib.rs
+@@ -9,7 +9,7 @@ pub mod wayland;
+ /// Opens a Vulkan device with `VK_EXT_hdr_metadata` too, when the GPU offers
+ /// it, so [`set_metadata`] can tell the compositor the real peak brightness.
+ /// `None` leaves opening to wgpu.
+-#[cfg(not(target_os = "macos"))]
++#[cfg(not(any(target_os = "macos", target_os = "android")))]
+ pub fn open_vulkan_device(
+     adapter: &wgpu::Adapter,
+     desc: &wgpu::DeviceDescriptor<'_>,
+@@ -57,7 +57,10 @@ pub fn set_metadata(
+     peak: f32,
+     black: f32,
+ ) {
+-    #[cfg(not(target_os = "macos"))]
++    // Android owns HDR/display metadata through SurfaceFlinger.  In
++    // particular, do not call a desktop Vulkan extension against the
++    // GameActivity surface even if the device advertises it.
++    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+     {
+         use wgpu::hal::api::Vulkan;
+         // Safety: read-only access to handles wgpu keeps alive while these guards live.
+@@ -94,6 +97,6 @@ pub fn set_metadata(
+         // Safety: a live swapchain of this device, one metadata entry for it.
+         unsafe { loader.set_hdr_metadata(&[swapchain], &[metadata]) };
+     }
+-    #[cfg(target_os = "macos")]
++    #[cfg(any(target_os = "macos", target_os = "android"))]
+     let _ = (device, surface, paper_white, peak, black);
+ }
